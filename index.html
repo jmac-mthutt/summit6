@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>Summit 6 Crowd Control Simulator</title>
+
+<style>
+  :root{
+    --green:#33cc55;
+    --amber:#e6ae37;
+    --red:#d84848;
+  }
+  body{
+    background:#111;
+    color:#fff;
+    font-family:Arial,sans-serif;
+    margin:0;
+    padding:0;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+  }
+  #stats{
+    width:90%;
+    max-width:500px;
+    background:#202020;
+    border:2px solid #555;
+    margin-top:6px;
+    padding:6px;
+    border-radius:8px;
+    text-align:center;
+    font-size:18px;
+  }
+  #gph{
+    font-weight:bold;
+  }
+  #timer{
+    font-weight:bold;
+  }
+  #goBtn, #restartBtn{
+    width:90%;
+    max-width:500px;
+    margin-top:10px;
+    padding:12px;
+    font-size:18px;
+    background:#555;
+    color:#fff;
+    border:1px solid #888;
+    border-radius:6px;
+    cursor:pointer;
+  }
+  #goBtn:disabled{
+    opacity:0.4;
+    cursor:not-allowed;
+  }
+  #restartBtn{
+    display:none;
+  }
+  #canvasContainer{
+    width:95%;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+  }
+  canvas{
+    width:100%;
+    max-width:500px;
+    height:auto;
+    background:#222;
+    border:2px solid #fff;
+    touch-action:none;
+  }
+  #timeUp{
+    position:fixed;
+    top:40%;
+    width:100%;
+    text-align:center;
+    font-size:30px;
+    color:#fff;
+    text-shadow:0 0 10px #000;
+    display:none;
+  }
+</style>
+
+</head>
+<body>
+
+<h2>Summit 6 Crowd Control Simulator</h2>
+
+<div id="stats">
+  Guests/hour: <span id="gph">0</span><br>
+  Timer: <span id="timer">03:00</span><br>
+  Score: <span id="score">0 out of 25</span>
+</div>
+
+<div id="canvasContainer">
+  <canvas id="gameCanvas" width="500" height="700"></canvas>
+</div>
+
+<div id="timeUp">⏰ Time Up!</div>
+
+<button id="goBtn" disabled>GO</button>
+<button id="restartBtn">Restart Game</button>
+
+<script>
+// ======================================================================
+//  GLOBAL GAME CONSTANTS
+// ======================================================================
+const canvas=document.getElementById('gameCanvas');
+const ctx=canvas.getContext('2d');
+
+const HEIGHT=canvas.height;
+const WIDTH=canvas.width;
+const GRID_UNIT=40;
+
+const ROW_HEIGHT=GRID_UNIT;
+const ROW_CENTER = GRID_UNIT/2;
+
+const COL_SIZES=[1,3,3,3];    // Column widths in grid cells
+const COL_X=[0,50,200,350];   // Pixel x-offsets per column
+// Reveal zone — bottom 3 rows ONLY (fixed)
+const REVEAL_ZONE_TOP = HEIGHT - 3 * GRID_UNIT;
+const TOKEN_COLOR='#41a3ff';
+const BASE_REVEAL_TIME=1500;  // ms for 6-token dwell reveal
+const BOTTOM_SELECT_ZONE = HEIGHT - 3*GRID_UNIT;
+
+let tokensPerSecond=0.5;
+let fallInterval=1000/tokensPerSecond;
+
+let groups=[];
+let selected=[];
+let columnHeights=[0,0,0,0];
+
+let rowsRemoved=[0,0,0,0];
+let tokensRemovedTotal=0;
+
+let startTime=performance.now();
+let gameOver=false;
+
+// ======================================================================
+//  UI ELEMENTS
+// ======================================================================
+const gphElem=document.getElementById('gph');
+const timerElem=document.getElementById('timer');
+const scoreElem=document.getElementById('score');
+const goBtn=document.getElementById('goBtn');
+const restartBtn=document.getElementById('restartBtn');
+const timeUpElem=document.getElementById('timeUp');
+
+const GAME_LIMIT=180000; // 3 minutes
+
+// ======================================================================
+//  INPUT HANDLING
+// ======================================================================
+let mouseX=-1000, mouseY=-1000;
+
+function processPointer(e){
+  const r=canvas.getBoundingClientRect();
+  if(e.touches){
+    mouseX = e.touches[0].clientX - r.left;
+    mouseY = e.touches[0].clientY - r.top;
+  }else{
+    mouseX = e.clientX - r.left;
+    mouseY = e.clientY - r.top;
+  }
+}
+
+canvas.addEventListener('mousemove',processPointer);
+canvas.addEventListener('touchmove',processPointer);
+canvas.addEventListener('mouseleave',()=>{mouseX=-1000;mouseY=-1000;});
+canvas.addEventListener('touchend',()=>{mouseX=-1000;mouseY=-1000;});
+
+// ======================================================================
+//  GROUP CLASS
+// ======================================================================
+class Group{
+  constructor(colIndex,tokenCount,yPos){
+    this.colIndex=colIndex;
+
+    // Column 1 (index 0) MUST be 1-token only
+    if(colIndex===0) tokenCount = 1;
+
+    this.tokenCount=tokenCount;
+
+    const cw = COL_SIZES[colIndex];
+    this.rows = Math.ceil(tokenCount / cw);
+
+    this.x = COL_X[colIndex];
+    this.y = (yPos !== undefined ? yPos : -this.rows*GRID_UNIT);
+
+    this.desiredY = this.y;
+    this.landed=false;
+    this.fallTimer=0;
+
+    this.revealProgress=0;
+    this.revealed=false;
+  }
+
+  get bottom(){
+    return this.y + this.rows*GRID_UNIT;
+  }
+
+  update(dt){
+    if(!this.landed){
+      this.fallTimer+=dt;
+      if(this.fallTimer>=fallInterval){
+        this.fallTimer=0;
+
+        const projected = this.y + GRID_UNIT;
+        const spaceBelow = HEIGHT - columnHeights[this.colIndex]*GRID_UNIT;
+
+        if(projected + this.rows*GRID_UNIT <= spaceBelow){
+          this.y = projected;
+        }else{
+          this.y = HEIGHT - (columnHeights[this.colIndex]+this.rows)*GRID_UNIT;
+          columnHeights[this.colIndex]+=this.rows;
+          this.landed=true;
+          this.desiredY=this.y;
+        }
+      }
+    }else{
+      const diff=this.desiredY-this.y;
+      if(Math.abs(diff)>1) this.y+=diff*0.2;
+      else this.y=this.desiredY;
+    }
+
+    if(!this.revealed && this.bottom>REVEAL_ZONE_TOP){
+      const near=this.isNear();
+      if(near){
+        const rev=(BASE_REVEAL_TIME*(this.tokenCount/6));
+        this.revealProgress+=dt/rev;
+        if(this.revealProgress>=1) this.revealed=true;
+      }else{
+        this.revealProgress=Math.max(0,this.revealProgress-0.002*dt);
+      }
+    }
+  }
+
+  isNear(){
+    const colW = COL_SIZES[this.colIndex];
+    let indexes = this.patternCells();   // → {rows, cols, cells[]}
+    for (const cell of indexes.cells){
+      const cx = this.x + cell.col*GRID_UNIT + ROW_CENTER;
+      const cy = this.y + cell.row*GRID_UNIT + ROW_CENTER;
+      if(Math.hypot(mouseX - cx, mouseY - cy) < 40) return true;
+    }
+    return false;
+  }
+
+  // --------------------------------------------------------------
+  // Returns { rows, cols, cells[] } describing token cell positions
+  // All shapes are grid-aligned here
+  // --------------------------------------------------------------
+  patternCells(){
+    switch(this.tokenCount){
+
+      case 1: // Column 1 only
+        return { rows:1, cols:1, cells:[{row:0,col:0}] };
+
+      case 2:
+        return {
+          rows:1, cols:2,
+          cells:[
+            {row:0,col:0}, {row:0,col:1}
+          ]
+        };
+
+      case 3:
+        return {
+          rows:1, cols:3,
+          cells:[
+            {row:0,col:0}, {row:0,col:1}, {row:0,col:2}
+          ]
+        };
+
+      case 4: // 2x2
+        return {
+          rows:2, cols:2,
+          cells:[
+            {row:0,col:0},{row:0,col:1},
+            {row:1,col:0},{row:1,col:1},
+          ]
+        };
+
+      case 5: // 3 bottom, 2 top (centered)
+        return {
+          rows:2, cols:3,
+          cells:[
+            {row:1,col:0},{row:1,col:1},{row:1,col:2},
+            {row:0,col:1},{row:0,col:2}, // offset to right
+          ]
+        };
+
+      case 6: // 3×2
+        return {
+          rows:2, cols:3,
+          cells:[
+            {row:0,col:0},{row:0,col:1},{row:0,col:2},
+            {row:1,col:0},{row:1,col:1},{row:1,col:2},
+          ]
+        };
+
+      default: // fallback → vertical stack
+        let c=[];
+        for(let i=0;i<this.tokenCount;i++)
+          c.push({row:i,col:0});
+        return {rows:this.tokenCount, cols:1, cells:c};
+    }
+  }
+
+  // ---------------------------------------------------------
+  // Draw using grid alignment
+  // ---------------------------------------------------------
+  draw(){
+    const isSel = selected.includes(this);
+    const pattern = this.patternCells();
+
+// PERFECT horizontal centering for 2‑wide and 2x2 groups
+const colGrid = COL_SIZES[this.colIndex];
+const offsetCols = (colGrid - pattern.cols) / 2;   // <-- allow half‑cell offsets for true centering
+
+    for(const cell of pattern.cells){
+      const cx = this.x + (offsetCols * GRID_UNIT) + (cell.col * GRID_UNIT) + ROW_CENTER;
+      const cy = this.y + cell.row*GRID_UNIT + ROW_CENTER;
+
+      ctx.beginPath();
+      ctx.arc(cx,cy, GRID_UNIT/2.5,0,Math.PI*2);
+      ctx.fillStyle=isSel?'yellow':TOKEN_COLOR;
+      ctx.fill();
+      ctx.closePath();
+
+      if(this.revealed){
+        ctx.fillStyle=isSel?'#000':'#fff';
+        ctx.font='bold 14px Arial';
+        ctx.textAlign='center';
+        ctx.textBaseline='middle';
+        ctx.fillText(this.tokenCount,cx,cy);
+      }
+    }
+  }
+}
+
+// ======================================================================
+//  GAME HELPERS
+// ======================================================================
+function randomTokenCount(col){
+  if(col===0) return 1;  // Column 1 only single tokens
+  return Math.floor(Math.random()*5)+2; // 2–6
+}
+
+function drawGrid(){
+  ctx.strokeStyle='#444';
+  for(let i=0;i<COL_X.length;i++)
+    ctx.strokeRect(COL_X[i],0,COL_SIZES[i]*GRID_UNIT,HEIGHT);
+
+  ctx.fillStyle='rgba(255,255,255,0.05)';
+  ctx.fillRect(0,BOTTOM_SELECT_ZONE,WIDTH,HEIGHT-BOTTOM_SELECT_ZONE);
+}
+
+function collapseColumn(c){
+  const col=groups.filter(g=>g.colIndex===c).sort((a,b)=>a.y-b.y);
+  let off=0;
+  for(let i=col.length-1;i>=0;i--){
+    const g=col[i];
+    g.desiredY=HEIGHT-(off+g.rows)*GRID_UNIT;
+    g.landed=true;
+    off+=g.rows;
+  }
+  columnHeights[c]=off;
+}
+
+function getClickedGroup(x,y){
+  return groups.findLast(g=>(
+    x>=g.x &&
+    x<=g.x + COL_SIZES[g.colIndex]*GRID_UNIT &&
+    y>=g.y &&
+    y<=g.bottom
+  ));
+}
+
+// ======================================================================
+//  SELECTION — ONLY bottom 3 rows
+// ======================================================================
+function selectHandler(x, y) {
+  if (gameOver) return;
+  // only bottom 3 rows are selectable
+  if (y < BOTTOM_SELECT_ZONE) return;
+  const g = getClickedGroup(x, y);
+  if (!g) return;
+  // cannot select until revealed
+  if (!g.revealed) return;
+  // cannot select if ANY group below it in same column is unselected
+  const blocked = groups.some(h =>
+    h.colIndex === g.colIndex &&
+    h.bottom > g.bottom &&        // below g
+    !selected.includes(h)         // and not selected
+  );
+  if (blocked) return;
+  // toggle selection
+  const already = selected.includes(g);
+  if (already) selected = selected.filter(s => s !== g);
+  else selected.push(g);
+  // update GO button
+  const total = selected.reduce((s, grp) => s + grp.tokenCount, 0);
+  goBtn.disabled = (total !== 6);
+}
+
+canvas.addEventListener('click',e=>{processPointer(e);selectHandler(mouseX,mouseY);});
+canvas.addEventListener('touchend',e=>{processPointer(e);selectHandler(mouseX,mouseY);});
+
+// ======================================================================
+//  GO & RESTART
+// ======================================================================
+goBtn.addEventListener('click',()=>{
+  if(selected.length===0||gameOver) return;
+
+  for(const g of selected){
+    rowsRemoved[g.colIndex]+=g.rows;
+    tokensRemovedTotal += g.tokenCount;
+  }
+
+  const affected=[...new Set(selected.map(g=>g.colIndex))];
+  groups=groups.filter(g=>!selected.includes(g));
+  selected=[];
+  affected.forEach(collapseColumn);
+  goBtn.disabled=true;
+});
+
+restartBtn.addEventListener('click',()=>{
+  resetVars();
+  fillColumnsToTop();
+  requestAnimationFrame(gameLoop);
+});
+
+// ======================================================================
+//  PROGRESSIVE SPEED
+// ======================================================================
+setInterval(()=>{
+  tokensPerSecond=Math.min(1, tokensPerSecond+0.1);
+  fallInterval=1000/tokensPerSecond;
+},60000);
+
+// ======================================================================
+//  STATS, GUESTS/HR, SCORE, TIMER
+// ======================================================================
+function updateStats(vals){
+  const now=performance.now();
+  const elapsed=(now-startTime)/1000;
+  const remain=Math.max(0,180-elapsed);
+
+  const mins=Math.floor(remain/60);
+  const secs=Math.floor(remain%60);
+  timerElem.textContent=`${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+
+  if(now-startTime>=GAME_LIMIT && !gameOver){
+    gameOver=true;
+    goBtn.disabled=true;
+    timeUpElem.style.display='block';
+    restartBtn.style.display='block';
+  }
+
+  const gph = elapsed>0 ? Math.round((tokensRemovedTotal/elapsed)*3600) : 0;
+  gphElem.textContent=gph;
+  if(gph>2400) gphElem.style.color='var(--green)';
+  else if(gph>=2000) gphElem.style.color='var(--amber)';
+  else gphElem.style.color='var(--red)';
+
+  const avg = vals.reduce((a,b)=>a+b,0)/vals.length;
+  const variance = vals.reduce((a,b)=>a + Math.pow(b-avg,2),0)/vals.length;
+  const stdev=Math.sqrt(variance);
+  score = stdev>0 ? (avg/stdev) : 0;
+
+  scoreElem.textContent = `${Math.round(score)} out of 25`;
+}
+
+// ======================================================================
+//  GAME LOOP
+// ======================================================================
+let last=0;
+function gameLoop(t){
+  const dt=t-last; last=t;
+
+  ctx.clearRect(0,0,WIDTH,HEIGHT);
+  drawGrid();
+
+  groups.forEach(g=>g.update(dt));
+  groups.forEach(g=>g.draw());
+
+  const elapsed=(performance.now()-startTime)/1000;
+  const vals=[0,0,0,0];
+  for(let i=0;i<4;i++)
+    vals[i] = rowsRemoved[i]>0 ? (elapsed/rowsRemoved[i]) : 0;
+
+  // draw counters at top of each column
+  ctx.font='bold 14px Arial';
+  ctx.fillStyle='#fff';
+  ctx.textAlign='center';
+  for(let c=0;c<4;c++){
+    const cx=COL_X[c] + (COL_SIZES[c]*GRID_UNIT)/2;
+    ctx.fillText(`${Math.round(vals[c])} s`, cx, 20);
+  }
+
+  updateStats(vals);
+
+  if(!gameOver) requestAnimationFrame(gameLoop);
+}
+
+// ======================================================================
+//  INITIAL FILL & SPAWN
+// ======================================================================
+function fillColumnsToTop(){
+  groups=[]; columnHeights.fill(0);
+
+  const rowsPerCol=Math.floor(HEIGHT/GRID_UNIT);
+
+  for(let c=0;c<4;c++){
+    let filled=0;
+    while(filled<rowsPerCol){
+      const n=randomTokenCount(c);
+      const g=new Group(c,n);
+      g.landed=true;
+      g.desiredY=g.y = HEIGHT-(filled+g.rows)*GRID_UNIT;
+      groups.push(g);
+      filled+=g.rows;
+    }
+    columnHeights[c]=filled;
+  }
+}
+
+function spawnGroups(){
+  if(gameOver) return;
+  for(let c=0;c<4;c++)
+    groups.push(new Group(c, randomTokenCount(c)));
+}
+
+fillColumnsToTop();
+setInterval(spawnGroups,2500);
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>
